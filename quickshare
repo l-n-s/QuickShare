@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+import sys
+import os
+import asyncio
+import tempfile
+import random
+import http.server
+import string
+
+from http import HTTPStatus
+from multiprocessing import Process
+from urllib.parse import quote
+from contextlib import closing
+
+from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QPushButton, 
+    QFileDialog, QDialog, QAbstractItemView, QListView,
+    QFileSystemModel, QLabel, QTreeView, QVBoxLayout, QMessageBox)
+
+import i2plib
+import i2plib.utils
+
+def build_slug():
+    """Random string"""
+    r = random.SystemRandom()
+    return "".join([r.choice(string.ascii_letters) for _ in range(8)])
+
+class FileDialog(QFileDialog):
+    """
+    Overridden version of QFileDialog which allows us to select
+    folders as well as, or instead of, files.
+    """
+    def __init__(self, *args, **kwargs):
+        QFileDialog.__init__(self, *args, **kwargs)
+        self.setOption(self.DontUseNativeDialog, True)
+        self.setOption(self.ReadOnly, True)
+        self.setOption(self.ShowDirsOnly, False)
+        self.setFileMode(self.ExistingFiles)
+        tree_view = self.findChild(QTreeView)
+        tree_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        list_view = self.findChild(QListView, "listView")
+        list_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
+
+    def accept(self):
+        QDialog.accept(self)
+
+class ShareServer(http.server.SimpleHTTPRequestHandler):
+    """Simple HTTP request handler modified for privacy"""
+    sys_version = "Python"
+    server_version = "ShareServer/1.0"
+
+    def log_message(self, *args):
+        """Disable logging"""
+        pass
+
+    def list_directory(self, path):
+        """Don't show index to protect from random visitors"""
+        if self.path == "/" or self.path.startswith("//"):
+            self.send_error(HTTPStatus.FORBIDDEN, "Forbidden")
+            return None
+        else:
+            return super().list_directory(path)
+        
+def serve_directory(server_address, path):
+    """Task to run in http_server_thread"""
+    os.chdir(path)
+    with http.server.HTTPServer(server_address, ShareServer) as httpd:
+        httpd.serve_forever()
+ 
+class QuickShareGui(QMainWindow):
+    """The main application window"""
+    def __init__(self, qtapp, i2ptunnel_thread, loop):
+        super().__init__()
+
+        self.http_server_thread = None
+        self.qtapp = qtapp
+        self.i2ptunnel_thread = i2ptunnel_thread
+        self.loop = loop
+
+        if not i2plib.utils.is_address_accessible(self.i2ptunnel_thread.sam_address):
+            QMessageBox.information(self, "Error", 
+                """SAM API is not reachable. Check if your I2P router is running!""", 
+                QMessageBox.Ok)
+
+        self.web_root = tempfile.TemporaryDirectory()
+        self.web_prefix = build_slug() 
+        self.shared_directory = os.path.join(self.web_root.name, 
+                                             self.web_prefix)
+        os.mkdir(self.shared_directory)
+
+        self.setMinimumSize(640, 480)
+        self.setWindowTitle('QuickShare I2P')
+
+        self.model = QFileSystemModel()
+        self.model.setRootPath(self.shared_directory)
+        self.tree = QTreeView()
+        self.tree.setModel(self.model)
+        self.tree.setRootIndex(self.model.index(self.shared_directory))
+        self.tree.setAnimated(False)
+        self.tree.setIndentation(20)
+        self.tree.setSortingEnabled(True)
+        self.tree.setWindowTitle("Dir View")
+
+        self.file_select = QPushButton('Select files', self)
+        self.file_select.clicked.connect(self.file_chooser)
+        self.file_select.setEnabled(False)
+
+        self.control_button = QPushButton('Start Sharing', self)
+        self.control_button.clicked.connect(self.toggle_tunnel)
+
+        self.url_description = QLabel(self)
+        self.url_description.setText("")
+        self.url_description.setWordWrap(True)
+        self.url = QLabel(self)
+        self.url.setText("")
+        self.url.setWordWrap(True)
+        self.url.setMinimumSize(self.url.sizeHint())
+        self.url.setStyleSheet('QLabel { background-color: #ffffff; color: #000000; padding: 10px; border: 1px solid #666666; }')
+
+        self.copy_url_button = QPushButton("Copy link to clipboard")
+        self.copy_url_button.setFlat(True)
+        self.copy_url_button.setStyleSheet('QPushButton { color: #3f7fcf; text-decoration: underline; }')
+        self.copy_url_button.clicked.connect(self.copy_url)
+        self.copy_url_button.setEnabled(False)
+
+        self.layout = QVBoxLayout()
+        self.layout.addWidget(self.tree)
+        self.layout.addWidget(self.file_select)
+        self.layout.addWidget(self.control_button)
+        self.layout.addWidget(self.url_description)
+        self.layout.addWidget(self.url)
+        self.layout.addWidget(self.copy_url_button)
+
+        central_widget = QWidget() 
+        central_widget.setLayout(self.layout)
+        self.setCentralWidget(central_widget)
+
+        self.i2ptunnel_thread.tunnel_started.connect(self.tunnel_started)
+        self.i2ptunnel_thread.tunnel_stopped.connect(self.tunnel_stopped)
+
+        self.show()
+
+    def toggle_tunnel(self):
+        """Toggle I2P tunnel state: start/stop"""
+        self.control_button.setEnabled(False)
+        self.control_button.setText("Please, wait...")
+        if not self.http_server_thread:
+            self.start_http_server()
+
+        if not self.i2ptunnel_thread.tunnel:
+            asyncio.run_coroutine_threadsafe(
+                    self.i2ptunnel_thread.start_tunnel(), self.loop)
+        else:
+            for l in os.scandir(self.shared_directory):
+                if l.is_symlink():
+                    os.unlink(l.path)
+            asyncio.run_coroutine_threadsafe(
+                    self.i2ptunnel_thread.stop_tunnel(), self.loop)
+
+    def start_http_server(self):
+        """Start HTTP server"""
+        self.http_server_thread = Process(target=serve_directory, 
+            args=(self.i2ptunnel_thread.server_address, self.web_root.name))
+        self.http_server_thread.daemon = True
+        self.http_server_thread.start()
+
+    @property
+    def b32link(self):
+        return "http://{}.b32.i2p/{}/".format(
+                self.i2ptunnel_thread.tunnel.destination.base32,
+                self.web_prefix)
+
+    def stop_http_server(self):
+        """Stop http server if it's running"""
+        if self.http_server_thread: self.http_server_thread.terminate()
+
+    def tunnel_started(self):
+        """On tunnel start"""
+        self.copy_url_button.setEnabled(True)
+        self.file_select.setEnabled(True)
+        self.control_button.setEnabled(True)
+        self.control_button.setText("Stop Sharing")
+        self.url_description.setText(
+                "Anyone with this link can download your files using I2P:")
+        self.url.setText(self.b32link)
+
+    def tunnel_stopped(self):
+        """On tunnel stop"""
+        self.copy_url_button.setEnabled(False)
+        self.file_select.setEnabled(False)
+        self.url_description.setText("")
+        self.url.setText("")
+        self.control_button.setEnabled(True)
+        self.control_button.setText("Start Sharing")
+
+    def copy_url(self):
+        """Copy hidden service URL to clipboard action"""
+        self.qtapp.clipboard().setText(self.b32link)
+
+    def file_chooser(self):
+        """Select files dialog"""
+        file_dialog = FileDialog(caption="Select shared files")
+        if file_dialog.exec_() == QDialog.Accepted:
+            files = file_dialog.selectedFiles()
+            urls = []
+            for f in files:
+                basename = os.path.basename(f)
+                urls.append(self.b32link + quote(basename))
+                linkpath = os.path.join(self.shared_directory, basename)
+                is_dir = os.path.isdir(f)
+                os.symlink(f, linkpath, target_is_directory=is_dir)
+            QMessageBox.information(self, "Success", 
+                "Added files: \n{}".format("\n\n".join(urls)), QMessageBox.Ok)
+
+
+class I2PTunnelThread(QThread):
+    """Thread with asyncio event loop and I2P tunnel"""
+    tunnel_started = pyqtSignal()
+    tunnel_stopped = pyqtSignal()
+
+    def __init__(self, loop, sam_address):
+        super().__init__()
+        self.loop = loop
+        self.sam_address = sam_address
+        self.server_address = ('127.0.0.1', i2plib.utils.get_free_port())
+        self.tunnel = None
+    
+    def run(self):
+        asyncio.set_event_loop(self.loop)
+        self.loop.set_debug(True)
+        with closing(self.loop):
+            self.loop.run_forever()
+
+    async def start_tunnel(self):
+        self.tunnel = i2plib.ServerTunnel(self.server_address, loop=self.loop, 
+                                     sam_address=self.sam_address)
+        await self.tunnel.run()
+        self.running = True
+        self.tunnel_started.emit()
+    
+    async def stop_tunnel(self):
+        self.tunnel.stop()
+        self.tunnel = None
+        self.tunnel_stopped.emit()
+
+    def stop(self):
+        if self.tunnel: 
+            stop_fut = asyncio.run_coroutine_threadsafe(self.stop_tunnel(), 
+                                                        self.loop)
+            stop_fut.add_done_callback(lambda fut: self.loop.stop())
+        else:
+            self.loop.stop()
+
+def main():
+    loop = asyncio.new_event_loop()
+    sam_address = i2plib.get_sam_address()
+
+    app = QApplication(sys.argv)
+
+    i2ptunnel_thread = I2PTunnelThread(loop, sam_address)
+    main_window = QuickShareGui(app, i2ptunnel_thread, loop)
+
+    i2ptunnel_thread.start()
+
+    app.lastWindowClosed.connect(i2ptunnel_thread.stop)
+    app.lastWindowClosed.connect(main_window.stop_http_server)
+
+    sys.exit(app.exec_())
+
+if __name__ == '__main__':
+    main()
